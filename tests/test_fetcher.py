@@ -4,7 +4,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from ecommerce_scraper.fetcher import Fetcher, FetchError, RetryPolicy
+from ecommerce_scraper.fetcher import Fetcher, FetchError, RateLimiter, RetryPolicy
 
 URL = "https://shop.test/page"
 
@@ -236,3 +236,80 @@ async def test_other_request_errors_fail_immediately_with_url(error: Exception) 
 
     assert len(handler.requests) == 1  # type: ignore[attr-defined]
     assert sleep.delays == []
+
+
+class FakeClock:
+    """Deterministic monotonic clock whose sleep advances time instantly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+async def test_rate_limit_spaces_request_starts_evenly() -> None:
+    clock = FakeClock()
+    started: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        started.append(clock())
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    fetcher = Fetcher(
+        client,
+        max_concurrency=4,
+        retry=RetryPolicy(attempts=1),
+        requests_per_second=2,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    await asyncio.gather(*(fetcher.fetch(f"{URL}/{i}") for i in range(4)))
+
+    assert started == [0.0, 0.5, 1.0, 1.5]
+
+
+async def test_rate_limit_counts_retries_too() -> None:
+    clock = FakeClock()
+    started: list[float] = []
+    responses = [httpx.Response(503), httpx.Response(200)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        started.append(clock())
+        return responses.pop(0)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    fetcher = Fetcher(
+        client,
+        max_concurrency=1,
+        retry=RetryPolicy(attempts=2, backoff_seconds=0.1, jitter=0),
+        requests_per_second=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    await fetcher.fetch(URL)
+
+    assert started == [0.0, 1.0]  # backoff (0.1 s) is shorter than the rate-limit spacing
+
+
+async def test_without_rate_limit_requests_are_not_delayed() -> None:
+    clock = FakeClock()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+    fetcher = Fetcher(
+        client, max_concurrency=4, retry=RetryPolicy(attempts=1), clock=clock, sleep=clock.sleep
+    )
+
+    await asyncio.gather(*(fetcher.fetch(f"{URL}/{i}") for i in range(4)))
+
+    assert clock.now == 0.0
+
+
+def test_rate_limiter_rejects_non_positive_rates() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        RateLimiter(0)

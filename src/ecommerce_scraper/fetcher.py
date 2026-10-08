@@ -1,9 +1,10 @@
-"""Polite, resilient HTTP GETs: bounded concurrency plus retry with backoff."""
+"""Polite, resilient HTTP GETs: rate limiting, bounded concurrency, retry with backoff."""
 
 import asyncio
 import logging
 import random
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -52,6 +53,34 @@ class FetchedPage:
     text: str
 
 
+class RateLimiter:
+    """Spaces the *start* of successive requests at least ``1 / per_second`` apart."""
+
+    def __init__(
+        self,
+        per_second: float | None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        if per_second is not None and per_second <= 0:
+            raise ValueError("per_second must be positive, or None to disable rate limiting")
+        self._interval = 1 / per_second if per_second else 0.0
+        self._clock = clock
+        self._sleep = sleep
+        self._next_start = float("-inf")
+        self._lock = asyncio.Lock()
+
+    async def wait_for_turn(self) -> None:
+        if not self._interval:
+            return
+        async with self._lock:  # waiters queue up and leave one interval apart
+            now = self._clock()
+            if self._next_start > now:
+                await self._sleep(self._next_start - now)
+            self._next_start = max(now, self._next_start) + self._interval
+
+
 class FetchError(Exception):
     """A URL could not be fetched, even after retrying."""
 
@@ -67,11 +96,14 @@ class Fetcher:
         *,
         max_concurrency: int,
         retry: RetryPolicy,
+        requests_per_second: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         random_fraction: Callable[[], float] = random.random,
     ) -> None:
         self._client = client
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._rate_limiter = RateLimiter(requests_per_second, clock=clock, sleep=sleep)
         self._retry = retry
         self._sleep = sleep
         self._random_fraction = random_fraction
@@ -97,6 +129,7 @@ class Fetcher:
                 attempt += 1
 
     async def _attempt(self, url: str) -> FetchedPage:
+        await self._rate_limiter.wait_for_turn()  # every attempt counts, retries included
         self.request_count += 1
         logger.debug("GET %s", url)
         try:

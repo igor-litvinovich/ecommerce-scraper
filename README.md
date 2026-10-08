@@ -28,6 +28,7 @@ OK: 423 results, total 345701.52
 {
   "results": [
     { "name": "Nokia 123", "description": "7 day battery", "price": 24.99, "colors": ["gold", "white", "black"] },
+    …
     { "name": "Dell Latitude 5580 128 GB", "description": "Dell Latitude 5580, 15.6\" FHD, Core i5-7300U, 16GB, 256GB SSD, Linux + Windows 10 Home", "price": 1178.19 },
     { "name": "Dell Latitude 5580 256 GB", "description": "…", "price": 1198.19 }
   ],
@@ -67,9 +68,10 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/out" ecommerce-scraper -o /
 | `--rate-limit` | 10 | Maximum requests per second (`0` disables the limit) |
 | `--concurrency` | 5 | Maximum simultaneous requests |
 | `--timeout` | 15 | Seconds allowed for each network step (connect, send, receive) |
+| `--deadline` | none | Give up if the whole run takes longer than this many seconds |
 | `--max-attempts` | 3 | Attempts per page on transient errors |
 | `--max-pages` | 200 | Limit on listing-page requests (guards against pagination loops) |
-| `--log-level` | INFO | stderr verbosity, case-insensitive (`debug` logs every request) |
+| `--log-level` | info | stderr verbosity: `debug` (every request), `info`, `warning`, `error` |
 
 ## Traps on the target site
 
@@ -84,7 +86,7 @@ Before writing any code I profiled the whole catalogue with a throwaway crawler.
 | 5 | The colour `<select>` has a **"Select color" placeholder**. | A bogus colour | Empty-value options are skipped. Only `select[aria-label=color]` counts as a colour picker |
 | 6 | **Listing pages truncate names** (`"Dell Latitude..."`). | Truncated names | All fields come from the product page |
 | 7 | **Prices are formatted inconsistently**: `$1178.19`, `$1149`, `$1124.2`. | Parse errors | A strict parser returns an exact `Decimal` and rejects other currencies, sub-cent amounts and garbage |
-| 8 | **Float drift.** In floats, the total prints as `345701.52000000037`, and the error depends on summation order. | A wrong-looking total | `Decimal` end to end. Values become JSON numbers only when written, losslessly |
+| 8 | **Float drift.** Adding up the variant prices one by one in floats gives `345701.52000000037`; the error depends on summation order. | A wrong-looking total | `Decimal` end to end. Values become JSON numbers only when written, losslessly |
 | 9 | **The site's own JavaScript displays float artefacts**, e.g. `$517.1700000000001` for product 92 at 256 GB. | Garbage prices if read from the rendered page | Surcharges are added in `Decimal`, giving `517.17`. The browser check pins this case |
 | 10 | **Names aren't unique**: 8 different "Dell Latitude 5480"s, and 3 "Iphone"s at the same price. | Real products lost to de-duplication | De-duplicated by URL only |
 | 11 | **Tablets have both HDD options and colours.** | One of the two lost | Each HDD variant keeps the colour list |
@@ -135,14 +137,21 @@ networking in `fetcher.py`.
   - a page returns 200 without the store's layout (a maintenance or captcha page);
   - a product can't be priced;
   - no products are found.
-- **Exit codes:** `0` success, `1` scrape or write failure, `2` usage error, `130`
-  interrupted. Bad arguments are rejected before any network traffic, including an output
-  path that is a directory, missing or unwritable.
+- **Exit codes:**
+  - `0`: success.
+  - `1`: the scrape or write failed (the site or the environment let us down).
+  - `2`: usage error.
+  - `70`: an internal bug, logged with its traceback.
+  - `130`: interrupted.
+
+  Bad arguments are rejected before any network traffic, including an output path that
+  is a directory, missing or unwritable. `--deadline` bounds the whole run.
 - **Fails fast:** the first failure cancels in-flight work, so a struggling site isn't
   hammered.
 - **Retries:** timeouts, connection errors and HTTP 429/500/502/503/504 are retried with
-  capped, jittered exponential backoff. `Retry-After` is honoured up to 10 s. Other errors
-  are permanent.
+  capped, jittered exponential backoff. A 429 or `Retry-After` pauses every worker, not just
+  the one that was told. A server asking for more than 10 s fails the page instead of
+  being retried early. Other errors are permanent.
 - **Scope:**
   - Navigation stays under the start URL, and products must be on the same host.
   - A redirect that leaves that scope fails the run.
@@ -169,8 +178,8 @@ networking in `fetcher.py`.
 ## Testing
 
 ```bash
-make test        # 175 offline tests, about 3 s, 99% branch coverage
-make test-live   # 5 checks against the real site, including a headless browser
+make test        # 185 offline tests, about 3 s, 99% branch coverage
+make test-live   # 4 checks against the real site, including a headless browser
 ```
 
 - **Unit tests:** the parser runs against real saved pages plus synthetic edge cases.
@@ -187,12 +196,13 @@ make test-live   # 5 checks against the real site, including a headless browser
   - A comparison of our surcharge table with the site's `app.js`.
   - A headless-Chromium pass (Playwright) over every product with HDD options. It clicks
     each option and requires the displayed price, rounded to cents, to equal ours. It also
-    confirms that 1024 GB can't be selected.
+    confirms that 1024 GB is still unavailable on each product.
 
   GitHub pauses scheduled workflows after 60 days without repository activity, so a
   long-lived deployment should keep the schedule alive.
 - **Static checks:** ruff, ruff format, strict mypy and hygiene hooks run through
   pre-commit, locally and in CI. CI runs on Python 3.12, 3.13 and 3.14.
+  `make hooks-update` bumps the hook pins, which Dependabot doesn't cover.
 
 ## Trade-offs and future improvements
 
@@ -214,7 +224,16 @@ make test-live   # 5 checks against the real site, including a headless browser
 
 ## How this was built
 
-The brief encourages AI assistance. This was developed test-first with Claude Code; each
-commit adds one module or capability together with its tests. A separate AI review pass
-re-derived the results and checked this README against the live site, and its findings
-are addressed.
+The brief encourages AI assistance; this was built with Claude Code.
+
+- **Investigation first.** Before any code was written, a throwaway crawl profiled the
+  whole site. The traps above, the expected 423 results and 345,701.52, and the
+  interpretation decisions all come from that step.
+- **Test-first.** Each module's tests were written and seen failing before its
+  implementation. Each commit adds one module or capability together with its tests.
+- **Verified in several independent ways:**
+  - an exact offline replay of the whole site;
+  - a contract validator that shares no code with the scraper;
+  - daily live checks against `app.js` and a real browser;
+  - separate AI review passes that re-derived the figures from the live site and checked
+    this README's claims. Their findings were addressed.

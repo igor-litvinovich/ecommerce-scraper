@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily canary: catches the target site changing its markup or pricing rules.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, type-check, test (Python ${{ matrix.python }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"] # every version pyproject.toml claims to support
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - name: Pre-commit hooks (ruff, ruff format, strict mypy, hygiene)
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+      - run: uv run pytest --cov --cov-report=term-missing
+
+  docker:
+    name: Build image
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -t ecommerce-scraper .
+      - run: docker run --rm ecommerce-scraper --version
+
+  live:
+    name: Live checks against webscraper.io
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --group browser
+      - run: uv run --group browser playwright install --with-deps chromium
+      - name: Live tests (real site, pricing rule vs app.js and vs a real browser)
+        run: uv run --group browser pytest -m live
+      - name: Scrape and validate the report against the output contract
+        run: |
+          uv run ecommerce-scraper --output report.json
+          uv run ecommerce-scraper-validate report.json

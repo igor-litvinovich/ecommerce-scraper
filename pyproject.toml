@@ -24,6 +24,7 @@ Repository = "https://github.com/igor-litvinovich/ecommerce-scraper"
 
 [project.scripts]
 ecommerce-scraper = "ecommerce_scraper.cli:main"
+ecommerce-scraper-validate = "ecommerce_scraper.validate:main"
 
 [dependency-groups]
 browser = [

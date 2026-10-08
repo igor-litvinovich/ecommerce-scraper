@@ -49,6 +49,7 @@ def main(
 
     try:
         report = asyncio.run(_scrape(args, transport))
+        text = render_json(report, indent=None if args.compact else 2)
     except ScrapeError as exc:
         logger.error("Scrape failed, no report written: %s", exc)
         return EXIT_SCRAPE_FAILED
@@ -59,7 +60,6 @@ def main(
         logger.exception("Internal error (please report it), no report written")
         return EXIT_INTERNAL_ERROR
 
-    text = render_json(report, indent=None if args.compact else 2)
     try:
         write_report(text, args.output)
     except OSError as exc:

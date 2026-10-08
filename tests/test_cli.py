@@ -342,3 +342,15 @@ def test_help_shows_the_actual_start_url(capsys: pytest.CaptureFixture[str]) -> 
         main(["--help"])
 
     assert DEFAULT_START_URL in "".join(capsys.readouterr().out.split())
+
+
+def test_a_report_that_cannot_be_rendered_exactly_is_an_internal_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    site = store()
+    site.pages[f"{ROOT}/product/2"] = product_html("Phone", "$12345678901234567.89")
+
+    assert run(site) == 70  # a JSON float cannot carry 19 significant digits
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Traceback" in err

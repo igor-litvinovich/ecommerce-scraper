@@ -81,13 +81,15 @@ def displayed_prices(page: Any) -> list[str]:
 
 
 def test_every_reported_hdd_price_matches_the_browser(page: Any, product_urls: list[str]) -> None:
-    mismatches, checked = [], 0
+    mismatches, selectable_1024, checked = [], [], 0
     for url in product_urls:
         page.goto(url)
         # Our price is computed from the very HTML the browser loaded.
         product = parse_product(page.content(), url)
         if not product.hdd_options:
             continue
+        if page.locator('button.swatch[value="1024"]').is_enabled():
+            selectable_1024.append(url)
         reported = [item.price for item in expand_product(product)]
         # The site's JS adds the surcharge in binary floating point, so it sometimes
         # displays artefacts such as $517.1700000000001; compare in cents.
@@ -98,6 +100,7 @@ def test_every_reported_hdd_price_matches_the_browser(page: Any, product_urls: l
 
     assert checked >= 100, "expected well over 100 products with HDD options"
     assert not mismatches
+    assert not selectable_1024, "1024 GB became available; it should now be scraped"
 
 
 def test_site_displays_float_artefacts_that_we_report_as_exact_cents(page: Any) -> None:
@@ -109,9 +112,3 @@ def test_site_displays_float_artefacts_that_we_report_as_exact_cents(page: Any) 
 
     assert shown == ["$497.17", "$517.1700000000001", "$537.1700000000001"]
     assert reported == [Decimal("497.17"), Decimal("517.17"), Decimal("537.17")]
-
-
-def test_the_1024_gb_option_cannot_be_selected(page: Any) -> None:
-    page.goto(f"{DEFAULT_START_URL}/product/140")
-
-    assert not page.locator('button.swatch[value="1024"]').is_enabled()

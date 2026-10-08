@@ -29,8 +29,9 @@ def test_scrapes_the_real_site(capsys: pytest.CaptureFixture[str]) -> None:
     report = json.loads(out, parse_float=Decimal)
     results = report["results"]
 
-    # 147 catalogue products at the time of writing, most with three HDD options.
-    assert len(results) > 300
+    # 423 at the time of writing (147 products, 138 of them in three HDD options); the
+    # bounds allow the catalogue to change without hiding a broken crawl.
+    assert 350 <= len(results) <= 600
     assert report["total"] == sum(item["price"] for item in results)
     assert all(item["name"] and item["price"] > 0 for item in results)
     assert all(len(item.get("colors", ["a", "b"])) >= 2 for item in results)

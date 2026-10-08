@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 IMAGE ?= ecommerce-scraper
 
-.PHONY: help install hooks format lint typecheck test test-live check run docker-build docker-run
+.PHONY: help install hooks hooks-update format lint typecheck test test-live check run docker-build docker-run
 
 help: ## Show available targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -11,6 +11,9 @@ install: ## Install the app and dev tools into .venv
 
 hooks: ## Install the git pre-commit hooks
 	uv run pre-commit install
+
+hooks-update: ## Bump pinned pre-commit hook versions (Dependabot doesn't cover them)
+	uv run pre-commit autoupdate --freeze
 
 format: ## Auto-format and auto-fix lint issues
 	uv run ruff format .

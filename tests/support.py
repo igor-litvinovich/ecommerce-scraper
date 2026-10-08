@@ -1,14 +1,30 @@
 """Shared test helpers."""
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SITE = "https://webscraper.io/test-sites/e-commerce/static"
+
+
+_open_clients: list[httpx.AsyncClient] = []
+
+
+def mock_client(handler: Callable[[httpx.Request], Any]) -> httpx.AsyncClient:
+    """An AsyncClient over an in-memory transport, closed automatically after each test."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    _open_clients.append(client)
+    return client
+
+
+async def close_mock_clients() -> None:
+    while _open_clients:
+        await _open_clients.pop().aclose()
 
 
 def read_fixture(name: str) -> str:

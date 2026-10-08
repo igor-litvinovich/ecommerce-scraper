@@ -54,7 +54,8 @@ class FetchedPage:
 
 
 class RateLimiter:
-    """Spaces the *start* of successive requests at least ``1 / per_second`` apart."""
+    """Spaces the *start* of successive requests at least ``1 / per_second`` apart,
+    and can hold every request back while the server asks us to slow down."""
 
     def __init__(
         self,
@@ -72,13 +73,15 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def wait_for_turn(self) -> None:
-        if not self._interval:
-            return
         async with self._lock:  # waiters queue up and leave one interval apart
             now = self._clock()
             if self._next_start > now:
                 await self._sleep(self._next_start - now)
             self._next_start = max(now, self._next_start) + self._interval
+
+    def pause_until(self, moment: float) -> None:
+        """Hold back every request, from every worker, until ``moment``."""
+        self._next_start = max(self._next_start, moment)
 
 
 class FetchError(Exception):
@@ -104,6 +107,7 @@ class Fetcher:
         self._client = client
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._rate_limiter = RateLimiter(requests_per_second, clock=clock, sleep=sleep)
+        self._clock = clock
         self._retry = retry
         self._sleep = sleep
         self._random_fraction = random_fraction
@@ -121,9 +125,16 @@ class Fetcher:
             except _TransientError as failure:
                 if attempt == self._retry.attempts:
                     raise FetchError(url, f"{failure} after {attempt} attempt(s)") from failure
+                limit = self._retry.max_backoff_seconds
+                if failure.retry_after is not None and failure.retry_after > limit:
+                    # Retrying sooner than the server asked would be impolite.
+                    reason = f"{failure}; server asked to wait {failure.retry_after:g}s"
+                    raise FetchError(url, f"{reason}, more than the {limit:g}s limit") from failure
                 delay = self._retry.delay_before_retry(
                     attempt, failure.retry_after, draw=self._random_fraction()
                 )
+                if failure.throttled:  # the whole client is too fast, not just this request
+                    self._rate_limiter.pause_until(self._clock() + delay)
                 logger.warning("%s fetching %s; retrying in %.1fs", failure, url, delay)
                 await self._sleep(delay)
                 attempt += 1
@@ -145,14 +156,19 @@ class Fetcher:
             return FetchedPage(url=str(response.url), text=response.text)
         reason = f"HTTP {response.status_code}"
         if response.status_code in _RETRYABLE_STATUSES:
-            raise _TransientError(reason, _parse_retry_after(response.headers.get("Retry-After")))
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            throttled = response.status_code == httpx.codes.TOO_MANY_REQUESTS or bool(retry_after)
+            raise _TransientError(reason, retry_after, throttled=throttled)
         raise FetchError(url, reason)
 
 
 class _TransientError(Exception):
-    def __init__(self, reason: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self, reason: str, retry_after: float | None = None, *, throttled: bool = False
+    ) -> None:
         super().__init__(reason)
         self.retry_after = retry_after
+        self.throttled = throttled
 
 
 def _parse_retry_after(value: str | None) -> float | None:

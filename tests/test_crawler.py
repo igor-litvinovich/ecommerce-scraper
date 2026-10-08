@@ -6,9 +6,11 @@ import pytest
 
 from ecommerce_scraper.crawler import ScrapeError, discover_product_urls, scrape
 from ecommerce_scraper.fetcher import Fetcher, RetryPolicy
-from tests.support import FakeSite, Page, Redirect, listing_html, product_html
+from tests.support import FakeSite, Page, Redirect, listing_html, mock_client, product_html
 
 ROOT = "https://shop.test/store"
+
+pytestmark = pytest.mark.usefixtures("mock_clients_closed")
 
 
 def mini_store() -> dict[str, Page]:
@@ -53,7 +55,7 @@ def mini_store() -> dict[str, Page]:
 
 
 def fetcher_for(site: FakeSite) -> Fetcher:
-    client = httpx.AsyncClient(transport=site.transport())
+    client = mock_client(site)
     return Fetcher(client, max_concurrency=4, retry=RetryPolicy(attempts=1))
 
 
@@ -193,7 +195,7 @@ async def test_programming_errors_propagate_instead_of_masquerading_as_scrape_fa
     def broken_transport(request: httpx.Request) -> httpx.Response:
         raise RuntimeError("bug in our code")
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(broken_transport))
+    client = mock_client(broken_transport)
     fetcher = Fetcher(client, max_concurrency=1, retry=RetryPolicy(attempts=1))
 
     with pytest.raises(ExceptionGroup) as exc_info:

@@ -264,3 +264,14 @@ async def test_logs_product_fetch_progress_about_every_ten_percent(
     assert product_progress[-1] == "Fetched 20/20 product pages (100%)"
     assert 5 <= len(product_progress) <= 11  # periodic, but not a line per page
     assert any(m.startswith("Crawled 1 listing page") for m in messages)
+
+
+async def test_follows_a_redirected_start_url_before_fixing_the_crawl_scope() -> None:
+    # e.g. http:// -> https:// or a www. canonicalisation on the very first request.
+    pages = mini_store()
+    pages["http://shop.test/store"] = Redirect(ROOT)
+    site = FakeSite(pages)
+
+    urls = await discover_product_urls(fetcher_for(site), "http://shop.test/store", max_pages=50)
+
+    assert urls == [f"{ROOT}/product/{n}" for n in (1, 2, 3, 4, 10)]

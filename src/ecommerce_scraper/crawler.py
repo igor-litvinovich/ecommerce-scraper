@@ -20,6 +20,10 @@ _TRAILING_NUMBER = re.compile(r"(\d+)/?$")
 _PROGRESS_REPORTS = 10  # log product-fetch progress roughly every 10%
 
 
+class OutOfScopeError(FetchError):
+    """A page redirected somewhere the crawl must not follow."""
+
+
 class ScrapeError(Exception):
     """The scrape could not produce a complete, trustworthy report."""
 
@@ -38,11 +42,8 @@ async def scrape(fetcher: Fetcher, start_url: str, *, max_pages: int) -> Report:
     if not product_urls:
         raise ScrapeError(f"no products found under {start_url}; has the site's markup changed?")
 
-    same_origin = _origin_checker(start_url)
     progress = _Progress(total=len(product_urls), noun="product pages")
-    products = await _run_all(
-        _fetch_product(fetcher, url, same_origin, progress) for url in product_urls
-    )
+    products = await _run_all(_fetch_product(fetcher, url, progress) for url in product_urls)
     try:
         return build_report(products)
     except PricingError as exc:
@@ -57,25 +58,17 @@ async def discover_product_urls(fetcher: Fetcher, start_url: str, *, max_pages: 
     until no new pages appear. Products are de-duplicated by URL and returned in
     numeric id order so output is stable between runs.
     """
+    # The very first request may be redirected (http -> https, a www. prefix), so the
+    # crawl scope is fixed from where the start page actually lives.
+    ((start_url, first_listing),) = await _run_all([_fetch_start(fetcher, start_url)])
     in_scope = _scope_checker(start_url)
     same_origin = _origin_checker(start_url)
-    visited: set[str] = set()
+    visited = {start_url}
     products: dict[str, None] = {}  # insertion-ordered set
-    frontier = [start_url]
-    pages_fetched = 0
+    listings = [first_listing]
+    pages_fetched = 1
 
-    while frontier:
-        # Bound the number of requests made, not just distinct URLs, so that even a
-        # revisiting bug ends in a clear error rather than an endless crawl.
-        pages_fetched += len(frontier)
-        if pages_fetched > max_pages:
-            raise ScrapeError(
-                f"crawl would exceed max_pages={max_pages}; is pagination looping, "
-                "or does the limit need raising?"
-            )
-        visited.update(frontier)
-        listings = await _run_all(_fetch_listing(fetcher, url, in_scope) for url in frontier)
-
+    while True:
         next_frontier: dict[str, None] = {}
         for listing in listings:
             # Product pages live outside the category paths (/static/product/N), so
@@ -88,13 +81,30 @@ async def discover_product_urls(fetcher: Fetcher, start_url: str, *, max_pages: 
                     if in_scope(link) and link not in visited
                 )
             )
-        frontier = list(next_frontier)
         logger.info(
             "Crawled %d listing page(s) so far; %d products found", pages_fetched, len(products)
         )
+        frontier = list(next_frontier)
+        if not frontier:
+            break
+        # Bound the number of requests made, not just distinct URLs, so that even a
+        # revisiting bug ends in a clear error rather than an endless crawl.
+        pages_fetched += len(frontier)
+        if pages_fetched > max_pages:
+            raise ScrapeError(
+                f"crawl would exceed max_pages={max_pages}; is pagination looping, "
+                "or does the limit need raising?"
+            )
+        visited.update(frontier)
+        listings = await _run_all(_fetch_listing(fetcher, url, in_scope) for url in frontier)
 
     logger.info("Discovered %d products across %d listing pages", len(products), pages_fetched)
     return sorted(products, key=_product_id_order)
+
+
+async def _fetch_start(fetcher: Fetcher, url: str) -> tuple[str, ListingPage]:
+    page = await fetcher.fetch(url)
+    return page.url, parse_listing(page.text, page.url)
 
 
 async def _fetch_listing(
@@ -102,16 +112,14 @@ async def _fetch_listing(
 ) -> ListingPage:
     page = await fetcher.fetch(url)
     if not in_scope(page.url):
-        raise FetchError(url, f"redirected outside the crawl scope (to {page.url})")
+        raise OutOfScopeError(url, f"redirected outside the crawl scope (to {page.url})")
     return parse_listing(page.text, page.url)
 
 
-async def _fetch_product(
-    fetcher: Fetcher, url: str, same_origin: Callable[[str], bool], progress: "_Progress"
-) -> ProductPage:
+async def _fetch_product(fetcher: Fetcher, url: str, progress: "_Progress") -> ProductPage:
     page = await fetcher.fetch(url)
-    if not same_origin(page.url):
-        raise FetchError(url, f"redirected to another site (to {page.url})")
+    if urlsplit(page.url)[:2] != urlsplit(url)[:2]:  # scheme and host
+        raise OutOfScopeError(url, f"redirected to another site (to {page.url})")
     product = parse_product(page.text, url)
     progress.advance()
     return product

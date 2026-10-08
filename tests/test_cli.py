@@ -1,17 +1,16 @@
+import asyncio
 import errno
 import json
-import logging
 import os
 import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from ecommerce_scraper.cli import main
+from ecommerce_scraper.cli import DEFAULT_START_URL, main
 from tests.support import FakeSite, listing_html, product_html
 
 ROOT = "https://shop.test/store"
@@ -39,16 +38,6 @@ def store() -> FakeSite:
             f"{ROOT}/product/2": product_html("Phone", "$9.99", extra=COLOR_SELECT),
         }
     )
-
-
-@pytest.fixture(autouse=True)
-def _restore_logging() -> Iterator[None]:
-    """main() configures the root logger, as a CLI should; undo that between tests."""
-    root = logging.getLogger()
-    handlers, level = root.handlers[:], root.level
-    yield
-    root.handlers[:] = handlers
-    root.setLevel(level)
 
 
 def run(site: FakeSite, *args: str) -> int:
@@ -132,6 +121,7 @@ def test_missing_output_directory_is_rejected_before_any_request(tmp_path: Path)
         ["--timeout", "inf"],
         ["--rate-limit", "-1"],
         ["--rate-limit", "nan"],
+        ["--deadline", "0"],
         ["--start-url", "ftp://shop.test/store"],
         ["--start-url", "not a url"],
     ],
@@ -204,21 +194,37 @@ def test_existing_output_file_keeps_its_permissions(tmp_path: Path) -> None:
     assert json.loads(destination.read_text())["total"] == 230.99
 
 
-def test_failed_write_leaves_no_temp_file_behind(
+def test_report_is_flushed_to_disk_before_it_replaces_the_old_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_write_text = Path.write_text
+    destination = tmp_path / "report.json"
+    destination.write_text("previous good report")
+    synced: list[str] = []
 
-    def disk_full(self: Path, *args: object, **kwargs: object) -> int:
-        real_write_text(self, "partial")  # the file gets created, then space runs out
+    def record_fsync(fd: int) -> None:
+        synced.append(destination.read_text())  # the old report is still in place
+
+    monkeypatch.setattr("ecommerce_scraper.output.os.fsync", record_fsync)
+
+    assert run(store(), "--output", str(destination)) == 0
+    assert synced == ["previous good report"]
+
+
+def test_disk_full_during_write_keeps_old_report_and_leaves_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    destination = tmp_path / "report.json"
+    destination.write_text("previous good report")
+
+    def disk_full(fd: int) -> None:  # space typically runs out when data is flushed
         raise OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(Path, "write_text", disk_full)
+    monkeypatch.setattr("ecommerce_scraper.output.os.fsync", disk_full)
 
-    exit_code = run(store(), "--output", str(tmp_path / "report.json"))
-
-    assert exit_code == 1
-    assert list(tmp_path.iterdir()) == []
+    assert run(store(), "--output", str(destination)) == 1
+    assert "No space left on device" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == [destination]
+    assert destination.read_text() == "previous good report"
 
 
 def test_output_to_a_device_such_as_dev_null_is_written_directly(
@@ -299,3 +305,40 @@ def test_runs_as_a_python_module() -> None:
 
     assert completed.returncode == 0
     assert completed.stdout.startswith("ecommerce-scraper ")
+
+
+def test_deadline_bounds_the_whole_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def stalls(*args: object, **kwargs: object) -> None:
+        await asyncio.sleep(30)  # e.g. a server trickling bytes just under the timeout
+
+    monkeypatch.setattr("ecommerce_scraper.cli.scrape", stalls)
+    started = time.monotonic()
+
+    exit_code = run(store(), "--deadline", "0.2")
+
+    assert exit_code == 1
+    assert time.monotonic() - started < 5
+    assert "0.2s deadline" in capsys.readouterr().err
+
+
+def test_internal_errors_exit_70_with_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def buggy(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("bug in our code")
+
+    monkeypatch.setattr("ecommerce_scraper.cli.scrape", buggy)
+
+    assert run(store()) == 70  # distinct from 1, which means "the site let us down"
+    err = capsys.readouterr().err
+    assert "Traceback" in err
+    assert "bug in our code" in err
+
+
+def test_help_shows_the_actual_start_url(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--help"])
+
+    assert DEFAULT_START_URL in "".join(capsys.readouterr().out.split())

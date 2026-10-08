@@ -59,7 +59,10 @@ def write_report(text: str, destination: str) -> None:
     # inherits the permissions of any report it replaces.
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())  # on disk before the rename makes it the report
         if path.is_file():
             shutil.copymode(path, tmp)
         os.replace(tmp, path)

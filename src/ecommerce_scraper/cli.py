@@ -6,6 +6,7 @@ stderr, and the exit code says whether the report can be trusted:
 * ``0`` - success, complete report written
 * ``1`` - scrape failed; nothing written (an existing ``--output`` file is kept)
 * ``2`` - invalid command-line usage
+* ``70`` - internal error (a bug); logged with its traceback, nothing written
 * ``130`` - interrupted
 """
 
@@ -33,6 +34,7 @@ PROJECT_URL = "https://github.com/igor-litvinovich/ecommerce-scraper"
 
 EXIT_OK = 0
 EXIT_SCRAPE_FAILED = 1
+EXIT_INTERNAL_ERROR = 70  # EX_SOFTWARE in sysexits.h
 EXIT_INTERRUPTED = 130
 
 logger = logging.getLogger("ecommerce_scraper")
@@ -53,6 +55,9 @@ def main(
     except KeyboardInterrupt:
         logger.error("Interrupted, no report written")
         return EXIT_INTERRUPTED
+    except Exception:
+        logger.exception("Internal error (please report it), no report written")
+        return EXIT_INTERNAL_ERROR
 
     text = render_json(report, indent=None if args.compact else 2)
     try:
@@ -77,7 +82,14 @@ async def _scrape(args: argparse.Namespace, transport: httpx.AsyncBaseTransport 
             requests_per_second=args.rate_limit or None,
             retry=RetryPolicy(attempts=args.max_attempts),
         )
-        report = await scrape(fetcher, args.start_url, max_pages=args.max_pages)
+        deadline = asyncio.timeout(args.deadline)  # None means no overall limit
+        try:
+            async with deadline:
+                report = await scrape(fetcher, args.start_url, max_pages=args.max_pages)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            raise ScrapeError(f"run exceeded the {args.deadline:g}s deadline") from None
 
     logger.info(
         "Scraped %d results (total %s) with %d HTTP requests in %.1fs",
@@ -94,19 +106,21 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="ecommerce-scraper",
         description="Scrape the webscraper.io static e-commerce test site into a JSON report.",
         epilog="exit status: 0 success, 1 scrape or write failed (nothing written), "
-        "2 usage error, 130 interrupted",
+        "2 usage error, 70 internal error, 130 interrupted",
     )
     parser.add_argument(
         "--start-url",
         type=_http_url,
         default=DEFAULT_START_URL,
-        help="where to start; navigation stays under this URL (default: the test site)",
+        metavar="URL",
+        help="where to start; navigation stays under this URL (default: %(default)s)",
     )
     parser.add_argument(
         "-o",
         "--output",
         type=_writable_destination,
         default="-",
+        metavar="PATH",
         help="file to write the JSON report to, atomically (default: stdout)",
     )
     parser.add_argument(
@@ -116,30 +130,42 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rate-limit",
         type=_bounded(float, minimum=0),
         default=10.0,
+        metavar="N",
         help="maximum requests per second; 0 disables the limit (default: %(default)s)",
     )
     parser.add_argument(
         "--concurrency",
         type=_bounded(int, minimum=1),
         default=5,
+        metavar="N",
         help="maximum simultaneous requests (default: %(default)s)",
     )
     parser.add_argument(
         "--timeout",
         type=_bounded(float, minimum=0, inclusive=False),
         default=15.0,
+        metavar="SECONDS",
         help="seconds allowed for each network step: connect, send, receive (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--deadline",
+        type=_bounded(float, minimum=0, inclusive=False),
+        default=None,
+        metavar="SECONDS",
+        help="give up if the whole run takes longer than this (default: no limit)",
     )
     parser.add_argument(
         "--max-attempts",
         type=_bounded(int, minimum=1),
         default=3,
+        metavar="N",
         help="attempts per page on transient errors, with backoff (default: %(default)s)",
     )
     parser.add_argument(
         "--max-pages",
         type=_bounded(int, minimum=1),
         default=200,
+        metavar="N",
         help="safety limit on listing-page requests (default: %(default)s)",
     )
     parser.add_argument(
@@ -147,7 +173,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str.upper,
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="stderr verbosity, case-insensitive (default: %(default)s)",
+        metavar="LEVEL",
+        help="stderr verbosity: debug, info, warning or error (default: %(default)s)",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {_version()}")
     return parser

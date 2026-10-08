@@ -1,0 +1,238 @@
+import asyncio
+from collections.abc import Callable
+
+import httpx
+import pytest
+
+from ecommerce_scraper.fetcher import Fetcher, FetchError, RetryPolicy
+
+URL = "https://shop.test/page"
+
+
+class RecordingSleep:
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.delays.append(seconds)
+
+
+def make_fetcher(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    retry: RetryPolicy | None = None,
+    max_concurrency: int = 4,
+    random_fraction: float = 0.0,
+) -> tuple[Fetcher, RecordingSleep]:
+    """Fetcher with a recorded sleep and a fixed jitter draw (0.0 = no jitter)."""
+    sleep = RecordingSleep()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    fetcher = Fetcher(
+        client,
+        max_concurrency=max_concurrency,
+        retry=retry or RetryPolicy(attempts=3, backoff_seconds=0.5, max_backoff_seconds=10),
+        sleep=sleep,
+        random_fraction=lambda: random_fraction,
+    )
+    return fetcher, sleep
+
+
+def scripted(*responses: httpx.Response | Exception) -> Callable[[httpx.Request], httpx.Response]:
+    """Handler that plays back the given responses (or raises the given errors) in order."""
+    queue = list(responses)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        outcome = queue.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    handler.requests = seen  # type: ignore[attr-defined]
+    return handler
+
+
+async def test_follows_redirects_and_reports_the_final_url() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/old":
+            return httpx.Response(301, headers={"Location": "/new"})
+        return httpx.Response(200, text="moved here")
+
+    # The client is not configured to follow redirects; the fetcher must do so itself.
+    fetcher, _ = make_fetcher(handler)
+
+    page = await fetcher.fetch("https://shop.test/old")
+
+    assert page.url == "https://shop.test/new"
+    assert page.text == "moved here"
+
+
+async def test_returns_body_of_successful_response() -> None:
+    fetcher, sleep = make_fetcher(scripted(httpx.Response(200, text="<html>ok</html>")))
+
+    assert (await fetcher.fetch(URL)).text == "<html>ok</html>"
+    assert sleep.delays == []
+    assert fetcher.request_count == 1
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+async def test_retries_transient_status_codes(status: int) -> None:
+    handler = scripted(httpx.Response(status), httpx.Response(200, text="recovered"))
+    fetcher, sleep = make_fetcher(handler)
+
+    assert (await fetcher.fetch(URL)).text == "recovered"
+    assert sleep.delays == [0.5]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ReadTimeout("timed out"),
+        httpx.RemoteProtocolError("peer closed connection"),
+    ],
+)
+async def test_retries_network_errors(error: Exception) -> None:
+    fetcher, _ = make_fetcher(scripted(error, httpx.Response(200, text="recovered")))
+
+    assert (await fetcher.fetch(URL)).text == "recovered"
+
+
+async def test_backs_off_exponentially_and_gives_up_after_configured_attempts() -> None:
+    handler = scripted(httpx.Response(503), httpx.Response(503), httpx.Response(503))
+    fetcher, sleep = make_fetcher(handler)
+
+    with pytest.raises(FetchError, match=r"503.*https://shop.test/page"):
+        await fetcher.fetch(URL)
+
+    assert len(handler.requests) == 3  # type: ignore[attr-defined]
+    assert sleep.delays == [0.5, 1.0]  # no pointless sleep after the final attempt
+
+
+async def test_backoff_is_capped() -> None:
+    handler = scripted(*[httpx.Response(503)] * 4, httpx.Response(200))
+    fetcher, sleep = make_fetcher(
+        handler, retry=RetryPolicy(attempts=5, backoff_seconds=1, max_backoff_seconds=3)
+    )
+
+    await fetcher.fetch(URL)
+
+    assert sleep.delays == [1, 2, 3, 3]
+
+
+async def test_honours_retry_after_header_within_the_cap() -> None:
+    handler = scripted(
+        httpx.Response(429, headers={"Retry-After": "7"}),
+        httpx.Response(429, headers={"Retry-After": "120"}),
+        httpx.Response(200),
+    )
+    fetcher, sleep = make_fetcher(handler)
+
+    await fetcher.fetch(URL)
+
+    assert sleep.delays == [7, 10]
+
+
+@pytest.mark.parametrize("value", ["Wed, 21 Oct 2015 07:28:00 GMT", "\u00b2", "-3", ""])
+async def test_ignores_unparseable_retry_after(value: str) -> None:
+    raw_header = [(b"Retry-After", value.encode())]  # as bytes, the way a server sends it
+    handler = scripted(httpx.Response(503, headers=raw_header), httpx.Response(200))
+    fetcher, sleep = make_fetcher(handler)
+
+    await fetcher.fetch(URL)
+
+    assert sleep.delays == [0.5]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 410])
+async def test_does_not_retry_permanent_client_errors(status: int) -> None:
+    handler = scripted(httpx.Response(status))
+    fetcher, sleep = make_fetcher(handler)
+
+    with pytest.raises(FetchError, match=str(status)):
+        await fetcher.fetch(URL)
+
+    assert len(handler.requests) == 1  # type: ignore[attr-defined]
+    assert sleep.delays == []
+
+
+async def test_network_error_after_last_attempt_is_wrapped_with_url() -> None:
+    fetcher, _ = make_fetcher(
+        scripted(httpx.ConnectError("boom"), httpx.ConnectError("boom"), httpx.ConnectError("boom"))
+    )
+
+    with pytest.raises(FetchError, match=r"ConnectError.*https://shop.test/page") as exc_info:
+        await fetcher.fetch(URL)
+
+    assert exc_info.value.url == URL
+
+
+async def test_never_exceeds_max_concurrency() -> None:
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return httpx.Response(200, text=str(request.url))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    fetcher = Fetcher(client, max_concurrency=3, retry=RetryPolicy(attempts=1))
+
+    pages = await asyncio.gather(*(fetcher.fetch(f"{URL}/{i}") for i in range(10)))
+
+    assert peak == 3
+    assert [page.text for page in pages] == [f"{URL}/{i}" for i in range(10)]
+
+
+async def test_jitter_shortens_each_backoff_by_up_to_the_configured_fraction() -> None:
+    handler = scripted(*[httpx.Response(503)] * 4, httpx.Response(200))
+    policy = RetryPolicy(attempts=5, backoff_seconds=1, max_backoff_seconds=3, jitter=0.5)
+    fetcher, sleep = make_fetcher(handler, retry=policy, random_fraction=1.0)
+
+    await fetcher.fetch(URL)
+
+    # Applied after the cap, so capped retries do not all fire in lockstep.
+    assert sleep.delays == [0.5, 1, 1.5, 1.5]
+
+
+async def test_jitter_never_shortens_a_server_requested_retry_after() -> None:
+    handler = scripted(httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200))
+    policy = RetryPolicy(attempts=2, jitter=0.5)
+    fetcher, sleep = make_fetcher(handler, retry=policy, random_fraction=1.0)
+
+    await fetcher.fetch(URL)
+
+    assert sleep.delays == [7]
+
+
+def test_retry_policy_rejects_nonsensical_values() -> None:
+    with pytest.raises(ValueError, match="attempts"):
+        RetryPolicy(attempts=0)
+    with pytest.raises(ValueError, match="backoff"):
+        RetryPolicy(backoff_seconds=-1)
+    with pytest.raises(ValueError, match="jitter"):
+        RetryPolicy(jitter=1.5)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.TooManyRedirects("redirect loop"),
+        httpx.DecodingError("malformed gzip body"),
+        httpx.UnsupportedProtocol("Request URL has an unsupported protocol 'ftp://'"),
+    ],
+)
+async def test_other_request_errors_fail_immediately_with_url(error: Exception) -> None:
+    handler = scripted(error)
+    fetcher, sleep = make_fetcher(handler)
+
+    with pytest.raises(FetchError, match=r"https://shop.test/page"):
+        await fetcher.fetch(URL)
+
+    assert len(handler.requests) == 1  # type: ignore[attr-defined]
+    assert sleep.delays == []

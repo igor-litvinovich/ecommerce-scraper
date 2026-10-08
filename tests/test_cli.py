@@ -2,6 +2,7 @@ import asyncio
 import errno
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -354,3 +355,21 @@ def test_a_report_that_cannot_be_rendered_exactly_is_an_internal_error(
     out, err = capsys.readouterr()
     assert out == ""
     assert "Traceback" in err
+
+
+def test_sigterm_exits_143_without_writing_a_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Schedulers such as Kubernetes stop a job with SIGTERM before killing it.
+    async def terminated_mid_run(*args: object, **kwargs: object) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr("ecommerce_scraper.cli.scrape", terminated_mid_run)
+    handler_before = signal.getsignal(signal.SIGTERM)
+    destination = tmp_path / "report.json"
+
+    assert run(store(), "--output", str(destination)) == 143
+    assert not destination.exists()
+    assert "Terminated" in capsys.readouterr().err
+    assert signal.getsignal(signal.SIGTERM) == handler_before  # restored for the caller

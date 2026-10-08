@@ -7,7 +7,8 @@ stderr, and the exit code says whether the report can be trusted:
 * ``1`` - scrape failed; nothing written (an existing ``--output`` file is kept)
 * ``2`` - invalid command-line usage
 * ``70`` - internal error (a bug); logged with its traceback, nothing written
-* ``130`` - interrupted
+* ``130`` - interrupted (Ctrl-C)
+* ``143`` - terminated (SIGTERM, e.g. a scheduler stopping the job)
 """
 
 import argparse
@@ -15,7 +16,9 @@ import asyncio
 import logging
 import math
 import os
+import signal
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from importlib.metadata import PackageNotFoundError, version
@@ -36,6 +39,7 @@ EXIT_OK = 0
 EXIT_SCRAPE_FAILED = 1
 EXIT_INTERNAL_ERROR = 70  # EX_SOFTWARE in sysexits.h
 EXIT_INTERRUPTED = 130
+EXIT_TERMINATED = 143  # 128 + SIGTERM
 
 logger = logging.getLogger("ecommerce_scraper")
 
@@ -47,6 +51,29 @@ def main(
     args = _build_parser().parse_args(argv)
     _configure_logging(args.log_level)
 
+    # Turn SIGTERM into an orderly shutdown, like Ctrl-C: in-flight work is cancelled
+    # and no partial report is written. Signal handlers can only be set on the main thread.
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    previous_handler = signal.signal(signal.SIGTERM, _terminate) if on_main_thread else None
+    try:
+        return _run(args, transport)
+    except _Terminated:
+        logger.error("Terminated, no report written")
+        return EXIT_TERMINATED
+    finally:
+        if on_main_thread:
+            signal.signal(signal.SIGTERM, previous_handler)
+
+
+class _Terminated(BaseException):
+    """Raised by the SIGTERM handler; a BaseException so no ``except Exception`` eats it."""
+
+
+def _terminate(signum: int, frame: object) -> None:
+    raise _Terminated
+
+
+def _run(args: argparse.Namespace, transport: httpx.AsyncBaseTransport | None) -> int:
     try:
         report = asyncio.run(_scrape(args, transport))
         text = render_json(report, indent=None if args.compact else 2)
@@ -106,7 +133,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="ecommerce-scraper",
         description="Scrape the webscraper.io static e-commerce test site into a JSON report.",
         epilog="exit status: 0 success, 1 scrape or write failed (nothing written), "
-        "2 usage error, 70 internal error, 130 interrupted",
+        "2 usage error, 70 internal error, 130 interrupted, 143 terminated",
     )
     parser.add_argument(
         "--start-url",

@@ -36,7 +36,10 @@ def _number(value: Decimal) -> float:
     # is the shortest string that round-trips, so a cents amount with fewer than 16
     # significant digits is written exactly as the Decimal ("1178.19"). Always a
     # float, so consumers see one type even for whole-dollar prices ("1149.0").
-    return float(value)
+    number = float(value)
+    if Decimal(repr(number)) != value:  # never let precision go missing unnoticed
+        raise ValueError(f"{value} cannot be written exactly as a JSON number")
+    return number
 
 
 def write_report(text: str, destination: str) -> None:

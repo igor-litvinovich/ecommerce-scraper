@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
+from types import MappingProxyType
 
 from ecommerce_scraper.models import HddOption, ProductPage, Report, ResultItem
 
@@ -13,12 +14,14 @@ logger = logging.getLogger(__name__)
 # app.js (`EcommerceProduct.updatePrice`), by adding a fixed surcharge to that
 # displayed price. We mirror that rule here; see the README for the trade-off
 # versus driving a headless browser.
-HDD_SURCHARGE_USD: Mapping[int, Decimal] = {
-    128: Decimal(0),
-    256: Decimal(20),
-    512: Decimal(40),
-    1024: Decimal(60),
-}
+HDD_SURCHARGE_USD: Mapping[int, Decimal] = MappingProxyType(
+    {
+        128: Decimal(0),
+        256: Decimal(20),
+        512: Decimal(40),
+        1024: Decimal(60),
+    }
+)
 
 
 class PricingError(ValueError):
@@ -52,9 +55,8 @@ def expand_product(product: ProductPage) -> list[ResultItem]:
 
 
 def build_report(products: Iterable[ProductPage]) -> Report:
-    """Expand every product into results and total their prices exactly."""
-    results = tuple(item for product in products for item in expand_product(product))
-    return Report(results=results, total=sum((item.price for item in results), Decimal(0)))
+    """Expand every product into the report's results (whose total is exact)."""
+    return Report(results=tuple(item for product in products for item in expand_product(product)))
 
 
 def _surcharge(option: HddOption, url: str) -> Decimal:

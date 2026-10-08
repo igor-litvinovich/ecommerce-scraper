@@ -117,17 +117,12 @@ class TestExpandProduct:
 
 
 class TestBuildReport:
-    def test_total_is_exact_decimal_sum_of_every_result(self) -> None:
-        # 0.1 + 0.2 + 0.7 is 0.9999999999999999 in binary floating point.
-        products = [
-            make_product(price="0.1"),
-            make_product(price="0.2"),
-            make_product(price="0.7"),
-        ]
+    def test_total_is_an_exact_decimal_sum(self) -> None:
+        # Summed as floats this would be 0.30000000000000004, which != Decimal("0.3").
+        report = build_report([make_product(price="0.1"), make_product(price="0.2")])
 
-        report = build_report(products)
-
-        assert report.total == Decimal("1.0")
+        assert isinstance(report.total, Decimal)
+        assert report.total == Decimal("0.3")
 
     def test_total_includes_every_hdd_variant(self) -> None:
         report = build_report([make_product(price="100", hdd=ALL_HDD), make_product(price="5")])

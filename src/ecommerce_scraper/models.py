@@ -49,4 +49,8 @@ class ResultItem:
 @dataclass(frozen=True, slots=True)
 class Report:
     results: tuple[ResultItem, ...]
-    total: Decimal
+
+    @property
+    def total(self) -> Decimal:
+        """Exact sum of every result's price; derived, so it can never disagree with them."""
+        return sum((item.price for item in self.results), Decimal(0))

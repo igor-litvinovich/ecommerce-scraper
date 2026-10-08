@@ -24,6 +24,8 @@ $ uv run ecommerce-scraper-validate report.json
 OK: 423 results, total 345701.52
 ```
 
+Abridged; the real output is indented with one field per line:
+
 ```json
 {
   "results": [
@@ -62,7 +64,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/out" ecommerce-scraper -o /
 
 | Option | Default | Purpose |
 |---|---|---|
-| `--start-url` | the test site | Where to start. A sub-category such as `…/phones/touch` also works |
+| `--start-url` | the test site | Where to start; redirects such as http→https are followed. A sub-category such as `…/phones/touch` also works |
 | `-o, --output` | stdout | Report file. Written atomically, keeping the existing file's permissions |
 | `--compact` | off | Single-line JSON |
 | `--rate-limit` | 10 | Maximum requests per second (`0` disables the limit) |
@@ -80,7 +82,7 @@ Before writing any code I profiled the whole catalogue with a throwaway crawler.
 | # | Pitfall | Naive result | Handling |
 |---|---|---|---|
 | 1 | The home page shows only **3 random "top items"**, and category pages 3 more. The 147 products sit under sub-categories. | 3 products | Breadth-first crawl of every category, sub-category and pagination link |
-| 2 | **Pagination is truncated**: page 1 links `1–10 … 19 20`, so pages 11–18 aren't linked from it. | About 40% of laptops missed | Each crawled page contributes its own page links; visited pages are never re-fetched |
+| 2 | **Pagination is truncated**: page 1 links only pages 2–10, 19 and 20, so pages 11–18 can't be reached from it. | About 40% of laptops missed | Each crawled page contributes its own page links; visited pages are never re-fetched |
 | 3 | **HDD prices exist only in JavaScript.** The HTML shows the 128 GB price; `app.js` adds $20/$40/$60 for 256/512/1024 GB. | Every variant gets the same price; total **337,421.52** | Surcharge table in `catalogue.py`; an unknown size fails the run rather than being guessed. Daily live checks compare the table with `app.js` and click every option of every product in a real browser |
 | 4 | **1024 GB is `disabled` on every product.** | 138 phantom products; total **465,253.39** | Excluded: the brief asks for every *available* product |
 | 5 | The colour `<select>` has a **"Select color" placeholder**. | A bogus colour | Empty-value options are skipped. Only `select[aria-label=color]` counts as a colour picker |
@@ -142,7 +144,9 @@ networking in `fetcher.py`.
   - `1`: the scrape or write failed (the site or the environment let us down).
   - `2`: usage error.
   - `70`: an internal bug, logged with its traceback.
-  - `130`: interrupted.
+  - `130`: interrupted (Ctrl-C).
+  - `143`: terminated by SIGTERM, for example a scheduler stopping the job; shut down
+    cleanly, nothing written.
 
   Bad arguments are rejected before any network traffic, including an output path that
   is a directory, missing or unwritable. `--deadline` bounds the whole run.
@@ -178,7 +182,7 @@ networking in `fetcher.py`.
 ## Testing
 
 ```bash
-make test        # 185 offline tests, about 3 s, 99% branch coverage
+make test        # 190 offline tests, about 3 s, 99% statement and branch coverage
 make test-live   # 4 checks against the real site, including a headless browser
 ```
 
@@ -229,8 +233,8 @@ The brief encourages AI assistance; this was built with Claude Code.
 - **Investigation first.** Before any code was written, a throwaway crawl profiled the
   whole site. The traps above, the expected 423 results and 345,701.52, and the
   interpretation decisions all come from that step.
-- **Test-first.** Each module's tests were written and seen failing before its
-  implementation. Each commit adds one module or capability together with its tests.
+- **Test-first.** Tests were written before each implementation. Commits pair each
+  capability with its tests, so the red-then-green steps are not separate commits.
 - **Verified in several independent ways:**
   - an exact offline replay of the whole site;
   - a contract validator that shares no code with the scraper;

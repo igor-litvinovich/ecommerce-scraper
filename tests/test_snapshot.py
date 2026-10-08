@@ -1,7 +1,7 @@
 """Offline end-to-end test against a recorded copy of the whole site.
 
 ``fixtures/site_snapshot.json.xz`` holds every page the scraper requested on
-2026-10-07 (179 pages, ~30 KB compressed; re-record deliberately with
+2026-10-07 (179 pages, 29 KB compressed; re-record deliberately with
 ``scripts/record_site_snapshot.py``). The expected figures below were established
 before this code base existed, by a throwaway profiling crawl of the live site, and agree
 with the examples given in the brief.

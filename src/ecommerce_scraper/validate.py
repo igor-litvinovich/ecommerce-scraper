@@ -115,6 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ecommerce-scraper-validate",
         description="Check a scraper report against the output contract.",
+        epilog="exit status: 0 valid, 1 invalid, 2 unreadable",
     )
     parser.add_argument("report", help="path to the JSON report ('-' reads stdin)")
     args = parser.parse_args(argv)
@@ -125,7 +126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             with open(args.report, encoding="utf-8") as stream:
                 text = stream.read()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:  # missing, unreadable, or not UTF-8
         print(f"cannot read {args.report}: {exc}", file=sys.stderr)
         return 2
 

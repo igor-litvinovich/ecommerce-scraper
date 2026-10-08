@@ -122,3 +122,20 @@ def test_cli_reads_stdin_for_piping(
 
     assert main(["-"]) == 0
     assert capsys.readouterr().out.startswith("OK: 3 results")
+
+
+def test_cli_reports_undecodable_file_as_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "report.json"
+    path.write_bytes(b'{"results": [], "total": \xff}')  # not UTF-8
+
+    assert main([str(path)]) == 2
+    assert "cannot read" in capsys.readouterr().err
+
+
+def test_help_documents_the_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--help"])
+
+    assert "0 valid, 1 invalid, 2 unreadable" in capsys.readouterr().out
